@@ -50,6 +50,8 @@ Use one of:
 1. `MATON_API_KEY=...`
 2. `MATON_API_KEY_FILE=/absolute/path/to/file`
 
+`MATON_API_KEY` may also be an OpenClaw-style `env://file/absolute/path` pointer.
+
 Optional connection pinning:
 
 1. `MATON_DROPBOX_CONNECTION=<connection_id>`

@@ -119,6 +119,14 @@ class VersionInfo:
 
 def load_secret_from_env_or_file(value_env: str, file_env: str) -> str | None:
     value = os.environ.get(value_env, "").strip()
+    if value.startswith("env://file/"):
+        file_path = Path(value.removeprefix("env://file")).expanduser()
+        if not file_path.exists():
+            raise BridgeError(f"{value_env} points to a missing env file: {file_path}")
+        secret = file_path.read_text(encoding="utf-8").strip()
+        if not secret:
+            raise BridgeError(f"{value_env} points to an empty env file: {file_path}")
+        return secret
     if value:
         return value
     file_path_raw = os.environ.get(file_env, "").strip()
