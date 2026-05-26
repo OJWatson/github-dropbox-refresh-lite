@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""GitHub -> Dropbox refresh bridge with Gmail draft notification."""
+"""GitHub -> Dropbox refresh bridge with Gmail notification."""
 
 from __future__ import annotations
 
@@ -9,8 +9,10 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import urllib.error
 import urllib.request
+import zipfile
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from email.message import EmailMessage
@@ -89,6 +91,7 @@ class Config:
     github_ref: str
     github_strategy: str
     github_token: str | None
+    source_mode: str
     local_source_dir: Path
     state_file: Path
     dropbox_backend: str
@@ -97,6 +100,7 @@ class Config:
     dropbox_permanent_delete: bool
     dropbox_force_new_share_link: bool
     gmail_backend: str
+    gmail_action: str
     gmail_to: str
     gmail_subject_prefix: str
     gmail_client_secret_file: Path
@@ -112,9 +116,19 @@ class VersionInfo:
     id: str
     label: str
     html_url: str
+    archive_ref: str
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+@dataclass(frozen=True)
+class DeliveryInfo:
+    action: str
+    id: str
+
+    def to_dict(self) -> dict[str, str]:
+        return {"action": self.action, "id": self.id}
 
 
 def load_secret_from_env_or_file(value_env: str, file_env: str) -> str | None:
@@ -162,12 +176,25 @@ def load_config(args: argparse.Namespace) -> Config:
     strategy = os.environ.get("GITHUB_VERSION_STRATEGY", "commit").strip().lower()
     if strategy not in {"commit", "release", "tag"}:
         raise BridgeError("GITHUB_VERSION_STRATEGY must be one of: commit, release, tag")
-    dropbox_backend = os.environ.get("DROPBOX_BACKEND", "maton").strip().lower()
+
+    source_mode = os.environ.get("SOURCE_MODE", "github_archive").strip().lower()
+    if source_mode not in {"github_archive", "local_dir"}:
+        raise BridgeError("SOURCE_MODE must be one of: github_archive, local_dir")
+
+    dropbox_backend = os.environ.get("DROPBOX_BACKEND", "token").strip().lower()
     if dropbox_backend not in {"maton", "token"}:
         raise BridgeError("DROPBOX_BACKEND must be one of: maton, token")
-    gmail_backend = os.environ.get("GMAIL_BACKEND", "maton").strip().lower()
+
+    gmail_backend = os.environ.get("GMAIL_BACKEND", "local").strip().lower()
     if gmail_backend not in {"maton", "local", "none"}:
         raise BridgeError("GMAIL_BACKEND must be one of: maton, local, none")
+
+    gmail_action = os.environ.get("GMAIL_ACTION", "send").strip().lower()
+    if gmail_action not in {"draft", "send"}:
+        raise BridgeError("GMAIL_ACTION must be one of: draft, send")
+    if gmail_backend == "none" and gmail_action == "send":
+        gmail_action = "draft"
+
     source_dir = Path(os.environ.get("LOCAL_SOURCE_DIR", "dummy_payload")).resolve()
     state_file = Path(args.state_file or os.environ.get("STATE_FILE", DEFAULT_STATE_FILE))
     maton_api_key = load_secret_from_env_or_file("MATON_API_KEY", "MATON_API_KEY_FILE")
@@ -175,12 +202,14 @@ def load_config(args: argparse.Namespace) -> Config:
     if not maton_gateway_base_url:
         raise BridgeError("MATON_GATEWAY_BASE_URL cannot be empty when set.")
     maton_gateway_base_url = maton_gateway_base_url.rstrip("/")
+
     return Config(
         github_owner=github_owner,
         github_repo=github_repo,
         github_ref=github_ref,
         github_strategy=strategy,
         github_token=os.environ.get("GITHUB_TOKEN"),
+        source_mode=source_mode,
         local_source_dir=source_dir,
         state_file=state_file,
         dropbox_backend=dropbox_backend,
@@ -189,6 +218,7 @@ def load_config(args: argparse.Namespace) -> Config:
         dropbox_permanent_delete=env_bool("DROPBOX_PERMANENT_DELETE", default=True),
         dropbox_force_new_share_link=env_bool("DROPBOX_FORCE_NEW_SHARE_LINK", default=True),
         gmail_backend=gmail_backend,
+        gmail_action=gmail_action,
         gmail_to=os.environ.get("GMAIL_TO", "oj.watson92@gmail.com"),
         gmail_subject_prefix=os.environ.get("GMAIL_SUBJECT_PREFIX", "[Dropbox Refresh]"),
         gmail_client_secret_file=Path(
@@ -203,17 +233,14 @@ def load_config(args: argparse.Namespace) -> Config:
 
 
 def github_get_json(path: str, token: str | None = None) -> dict[str, Any] | list[Any]:
-    req = urllib.request.Request(
-        f"{GITHUB_API}{path}",
-        headers={
-            "Accept": "application/vnd.github+json",
-            "Authorization": f"Bearer {token}" if token else "",
-            "User-Agent": "github-dropbox-refresh-lite",
-        },
-    )
-    # Remove empty Authorization header if token absent.
-    if not token:
-        req.headers.pop("Authorization", None)
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "github-dropbox-refresh-lite",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    req = urllib.request.Request(f"{GITHUB_API}{path}", headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:  # noqa: S310
             return json.loads(resp.read().decode("utf-8"))
@@ -224,19 +251,47 @@ def github_get_json(path: str, token: str | None = None) -> dict[str, Any] | lis
         raise BridgeError(f"GitHub API connection failed: {exc}") from exc
 
 
+def github_download_archive_zip(cfg: Config, archive_ref: str) -> bytes:
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "github-dropbox-refresh-lite",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    if cfg.github_token:
+        headers["Authorization"] = f"Bearer {cfg.github_token}"
+    path = f"/repos/{cfg.github_owner}/{cfg.github_repo}/zipball/{archive_ref}"
+    req = urllib.request.Request(f"{GITHUB_API}{path}", headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:  # noqa: S310
+            return resp.read()
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        raise BridgeError(f"GitHub archive download error {exc.code}: {body}") from exc
+    except urllib.error.URLError as exc:
+        raise BridgeError(f"GitHub archive download failed: {exc}") from exc
+
+
 def detect_version(cfg: Config) -> VersionInfo:
     base = f"/repos/{cfg.github_owner}/{cfg.github_repo}"
     if cfg.github_strategy == "commit":
         payload = github_get_json(f"{base}/commits/{cfg.github_ref}", cfg.github_token)
         assert isinstance(payload, dict)
         sha = str(payload["sha"])
-        return VersionInfo(id=sha, label=sha[:12], html_url=str(payload["html_url"]))
+        return VersionInfo(id=sha, label=sha[:12], html_url=str(payload["html_url"]), archive_ref=sha)
+
     if cfg.github_strategy == "release":
         payload = github_get_json(f"{base}/releases/latest", cfg.github_token)
         assert isinstance(payload, dict)
         rid = str(payload["id"])
-        tag = str(payload.get("tag_name", "release"))
-        return VersionInfo(id=rid, label=tag, html_url=str(payload["html_url"]))
+        tag = str(payload.get("tag_name") or "release")
+        archive_ref = str(payload.get("tag_name") or payload.get("target_commitish") or cfg.github_ref)
+        return VersionInfo(
+            id=rid,
+            label=tag,
+            html_url=str(payload["html_url"]),
+            archive_ref=archive_ref,
+        )
+
     payload = github_get_json(f"{base}/tags?per_page=1", cfg.github_token)
     assert isinstance(payload, list)
     if not payload:
@@ -248,6 +303,7 @@ def detect_version(cfg: Config) -> VersionInfo:
         id=f"{tag}:{sha}",
         label=tag,
         html_url=f"https://github.com/{cfg.github_owner}/{cfg.github_repo}/tree/{sha}",
+        archive_ref=tag,
     )
 
 
@@ -464,13 +520,13 @@ def _ensure_parent_folders_dropbox_maton(cfg: Config, remote_file_path: str, cre
         created.add(current)
 
 
-def refresh_dropbox_folder_token(cfg: Config, dry_run: bool = False) -> str:
+def refresh_dropbox_folder_token(cfg: Config, source_dir: Path, dry_run: bool = False) -> str:
     if dry_run:
         return f"https://www.dropbox.com/home{cfg.dropbox_target_path}"
     if not cfg.dropbox_token:
         raise BridgeError("DROPBOX_ACCESS_TOKEN is required for DROPBOX_BACKEND=token.")
-    if not cfg.local_source_dir.exists():
-        raise BridgeError(f"Local source directory not found: {cfg.local_source_dir}")
+    if not source_dir.exists():
+        raise BridgeError(f"Source directory not found: {source_dir}")
     import dropbox
 
     dbx = dropbox.Dropbox(cfg.dropbox_token)
@@ -496,9 +552,9 @@ def refresh_dropbox_folder_token(cfg: Config, dry_run: bool = False) -> str:
             raise
 
     created_folders = {cfg.dropbox_target_path}
-    files = sorted(path for path in cfg.local_source_dir.rglob("*") if path.is_file())
+    files = sorted(path for path in source_dir.rglob("*") if path.is_file())
     for path in files:
-        rel = path.relative_to(cfg.local_source_dir).as_posix()
+        rel = path.relative_to(source_dir).as_posix()
         remote_path = f"{cfg.dropbox_target_path.rstrip('/')}/{rel}"
         _ensure_parent_folders_dropbox_token(dbx, remote_path, created_folders)
         _upload_file_dropbox_token(dbx, path, remote_path)
@@ -517,11 +573,11 @@ def refresh_dropbox_folder_token(cfg: Config, dry_run: bool = False) -> str:
     return link.url
 
 
-def refresh_dropbox_folder_maton(cfg: Config, dry_run: bool = False) -> str:
+def refresh_dropbox_folder_maton(cfg: Config, source_dir: Path, dry_run: bool = False) -> str:
     if dry_run:
         return f"https://www.dropbox.com/home{cfg.dropbox_target_path}"
-    if not cfg.local_source_dir.exists():
-        raise BridgeError(f"Local source directory not found: {cfg.local_source_dir}")
+    if not source_dir.exists():
+        raise BridgeError(f"Source directory not found: {source_dir}")
 
     _maton_dropbox_json(cfg, "users/get_current_account", None)
 
@@ -549,9 +605,9 @@ def refresh_dropbox_folder_maton(cfg: Config, dry_run: bool = False) -> str:
             raise
 
     created_folders = {cfg.dropbox_target_path}
-    files = sorted(path for path in cfg.local_source_dir.rglob("*") if path.is_file())
+    files = sorted(path for path in source_dir.rglob("*") if path.is_file())
     for path in files:
-        rel = path.relative_to(cfg.local_source_dir).as_posix()
+        rel = path.relative_to(source_dir).as_posix()
         remote_path = f"{cfg.dropbox_target_path.rstrip('/')}/{rel}"
         _ensure_parent_folders_dropbox_maton(cfg, remote_path, created_folders)
         _upload_file_dropbox_maton(cfg, path, remote_path)
@@ -584,10 +640,45 @@ def refresh_dropbox_folder_maton(cfg: Config, dry_run: bool = False) -> str:
     return str(created_link["url"])
 
 
-def refresh_dropbox_folder(cfg: Config, dry_run: bool = False) -> str:
+def refresh_dropbox_folder(cfg: Config, source_dir: Path, dry_run: bool = False) -> str:
     if cfg.dropbox_backend == "maton":
-        return refresh_dropbox_folder_maton(cfg, dry_run=dry_run)
-    return refresh_dropbox_folder_token(cfg, dry_run=dry_run)
+        return refresh_dropbox_folder_maton(cfg, source_dir, dry_run=dry_run)
+    return refresh_dropbox_folder_token(cfg, source_dir, dry_run=dry_run)
+
+
+def prepare_source_directory(cfg: Config, version: VersionInfo, dry_run: bool) -> tuple[Path, tempfile.TemporaryDirectory[str] | None]:
+    if cfg.source_mode == "local_dir":
+        if not cfg.local_source_dir.exists():
+            raise BridgeError(f"LOCAL_SOURCE_DIR does not exist: {cfg.local_source_dir}")
+        return cfg.local_source_dir, None
+
+    # github_archive mode: for dry-run we can skip network/download and just return current repo path.
+    if dry_run:
+        return Path.cwd(), None
+
+    archive_bytes = github_download_archive_zip(cfg, version.archive_ref)
+    temp_root = tempfile.TemporaryDirectory(prefix="github_snapshot_")
+    snapshot_root = Path(temp_root.name) / "snapshot"
+    snapshot_root.mkdir(parents=True, exist_ok=True)
+
+    zip_path = Path(temp_root.name) / "archive.zip"
+    zip_path.write_bytes(archive_bytes)
+
+    with zipfile.ZipFile(zip_path) as zf:
+        members = [name for name in zf.namelist() if name and not name.endswith("/")]
+        if not members:
+            raise BridgeError("Downloaded GitHub archive is empty.")
+        for member in members:
+            parts = Path(member).parts
+            if len(parts) <= 1:
+                continue
+            rel_parts = parts[1:]
+            out_path = snapshot_root.joinpath(*rel_parts)
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            with zf.open(member, "r") as src, out_path.open("wb") as dst:
+                dst.write(src.read())
+
+    return snapshot_root, temp_root
 
 
 def build_email(version: VersionInfo, dropbox_link: str, cfg: Config) -> EmailMessage:
@@ -607,7 +698,7 @@ def build_email(version: VersionInfo, dropbox_link: str, cfg: Config) -> EmailMe
                 f"Dropbox share link: {dropbox_link}",
                 f"Run timestamp (UTC): {now_iso()}",
                 "",
-                "This is an auto-generated draft. Edit as needed before sending.",
+                "This is an auto-generated notification.",
             ]
         )
         + "\n"
@@ -615,23 +706,7 @@ def build_email(version: VersionInfo, dropbox_link: str, cfg: Config) -> EmailMe
     return msg
 
 
-def create_gmail_draft(cfg: Config, message: EmailMessage, dry_run: bool = False) -> str:
-    if cfg.gmail_backend == "none":
-        return "disabled"
-    if dry_run:
-        return "dry-run-draft-id"
-    if cfg.gmail_backend == "maton":
-        raw = base64.urlsafe_b64encode(message.as_bytes()).decode("utf-8")
-        payload = {"message": {"raw": raw}}
-        response = http_json_request(
-            f"{cfg.maton_gateway_base_url}/google-mail/gmail/v1/users/me/drafts",
-            method="POST",
-            json_body=payload,
-            headers=_maton_headers(cfg, cfg.maton_google_mail_connection),
-        )
-        assert isinstance(response, dict)
-        return str(response["id"])
-
+def _gmail_local_credentials(cfg: Config) -> Any:
     if not cfg.gmail_client_secret_file.exists():
         raise BridgeError(
             f"Gmail client secret file missing: {cfg.gmail_client_secret_file}. "
@@ -641,9 +716,8 @@ def create_gmail_draft(cfg: Config, message: EmailMessage, dry_run: bool = False
     from google.auth.transport.requests import Request
     from google.oauth2.credentials import Credentials
     from google_auth_oauthlib.flow import InstalledAppFlow
-    from googleapiclient.discovery import build
 
-    scopes = ["https://www.googleapis.com/auth/gmail.compose"]
+    scopes = ["https://www.googleapis.com/auth/gmail.compose", "https://www.googleapis.com/auth/gmail.send"]
     creds = None
     if cfg.gmail_token_file.exists():
         creds = Credentials.from_authorized_user_file(cfg.gmail_token_file.as_posix(), scopes)
@@ -657,12 +731,50 @@ def create_gmail_draft(cfg: Config, message: EmailMessage, dry_run: bool = False
             creds = flow.run_local_server(port=0)
         cfg.gmail_token_file.parent.mkdir(parents=True, exist_ok=True)
         cfg.gmail_token_file.write_text(creds.to_json(), encoding="utf-8")
+    return creds
+
+
+def deliver_gmail(cfg: Config, message: EmailMessage, dry_run: bool = False) -> DeliveryInfo:
+    if cfg.gmail_backend == "none":
+        return DeliveryInfo(action="disabled", id="disabled")
+    if dry_run:
+        return DeliveryInfo(action=cfg.gmail_action, id="dry-run")
+
+    raw = base64.urlsafe_b64encode(message.as_bytes()).decode("utf-8")
+    payload = {"raw": raw}
+
+    if cfg.gmail_backend == "maton":
+        if cfg.gmail_action == "draft":
+            response = http_json_request(
+                f"{cfg.maton_gateway_base_url}/google-mail/gmail/v1/users/me/drafts",
+                method="POST",
+                json_body={"message": payload},
+                headers=_maton_headers(cfg, cfg.maton_google_mail_connection),
+            )
+            assert isinstance(response, dict)
+            return DeliveryInfo(action="draft", id=str(response["id"]))
+
+        response = http_json_request(
+            f"{cfg.maton_gateway_base_url}/google-mail/gmail/v1/users/me/messages/send",
+            method="POST",
+            json_body=payload,
+            headers=_maton_headers(cfg, cfg.maton_google_mail_connection),
+        )
+        assert isinstance(response, dict)
+        return DeliveryInfo(action="send", id=str(response.get("id", "sent")))
+
+    creds = _gmail_local_credentials(cfg)
+    from googleapiclient.discovery import build
 
     service = build("gmail", "v1", credentials=creds)
-    raw = base64.urlsafe_b64encode(message.as_bytes()).decode("utf-8")
-    payload = {"message": {"raw": raw}}
-    created = service.users().drafts().create(userId="me", body=payload).execute()
-    return str(created["id"])
+    if cfg.gmail_action == "draft":
+        created = (
+            service.users().drafts().create(userId="me", body={"message": payload}).execute()
+        )
+        return DeliveryInfo(action="draft", id=str(created["id"]))
+
+    sent = service.users().messages().send(userId="me", body=payload).execute()
+    return DeliveryInfo(action="send", id=str(sent["id"]))
 
 
 def run_once(
@@ -683,27 +795,37 @@ def run_once(
             "state_file": cfg.state_file.as_posix(),
         }
 
-    dropbox_link = refresh_dropbox_folder(cfg, dry_run=dry_run)
+    source_dir, temp_snapshot = prepare_source_directory(cfg, version, dry_run=dry_run)
+    try:
+        dropbox_link = refresh_dropbox_folder(cfg, source_dir, dry_run=dry_run)
+    finally:
+        if temp_snapshot is not None:
+            temp_snapshot.cleanup()
+
     message = build_email(version, dropbox_link, cfg)
-    draft_id = create_gmail_draft(cfg, message, dry_run=dry_run)
+    delivery = deliver_gmail(cfg, message, dry_run=dry_run)
 
     updated_state = {
         "last_processed_version": version.id,
         "last_label": version.label,
         "last_version_url": version.html_url,
+        "last_archive_ref": version.archive_ref,
         "last_dropbox_link": dropbox_link,
-        "last_gmail_draft_id": draft_id,
+        "last_gmail_delivery": delivery.to_dict(),
         "last_run_utc": now_iso(),
     }
     save_state(cfg.state_file, updated_state)
+
     return {
         "ok": True,
         "changed": True,
         "dry_run": dry_run,
+        "source_mode": cfg.source_mode,
+        "source_dir": source_dir.as_posix(),
         "version": version.to_dict(),
         "dropbox_link": dropbox_link,
         "email_preview": message.as_string() if dry_run else None,
-        "gmail_draft_id": draft_id,
+        "gmail_delivery": delivery.to_dict(),
         "state_file": cfg.state_file.as_posix(),
     }
 
@@ -719,6 +841,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mock-version-id")
     parser.add_argument("--mock-version-label")
     parser.add_argument("--mock-version-url")
+    parser.add_argument("--mock-version-archive-ref")
     return parser
 
 
@@ -730,7 +853,9 @@ def main(argv: list[str] | None = None) -> int:
             id=args.mock_version_id,
             label=args.mock_version_label or args.mock_version_id[:12],
             html_url=args.mock_version_url or "https://example.invalid/mock-version",
+            archive_ref=args.mock_version_archive_ref or args.mock_version_id,
         )
+
     try:
         cfg = load_config(args)
         result = run_once(cfg, force=args.force, dry_run=args.dry_run, version_override=override)
