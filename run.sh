@@ -2,4 +2,8 @@
 set -euo pipefail
 
 cd "$(dirname "$0")"
-python bridge.py "$@"
+if [ -x ".venv/bin/python" ]; then
+  exec .venv/bin/python bridge.py "$@"
+fi
+
+exec "${PYTHON:-python}" bridge.py "$@"
